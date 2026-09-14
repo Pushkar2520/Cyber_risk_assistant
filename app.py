@@ -9,6 +9,16 @@ Main entry point for the application. Orchestrates:
   5. Interactive dashboard display
 """
 
+# ─── SQLite fix for Streamlit Cloud ──────────────────────────────────────────
+# ChromaDB requires sqlite3 >= 3.35.0 but Streamlit Cloud has an older version.
+# This monkey-patch must run BEFORE any chromadb import.
+try:
+    __import__("pysqlite3")
+    import sys
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except ImportError:
+    pass  # Not on Streamlit Cloud, system sqlite3 is fine
+
 import streamlit as st
 import pandas as pd
 import os
