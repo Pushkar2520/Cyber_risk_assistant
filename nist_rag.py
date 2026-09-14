@@ -18,7 +18,6 @@ import streamlit as st
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-CHROMA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
 COLLECTION_NAME = "nist_sp800_53_rev5"
 
 
@@ -28,14 +27,8 @@ def get_embedding_function():
 
 
 def get_chroma_client():
-    """Get or create a persistent ChromaDB client. Handles singleton conflicts."""
-    try:
-        return chromadb.PersistentClient(path=CHROMA_DIR)
-    except KeyError:
-        # SharedSystemClient singleton conflict — reset and retry
-        from chromadb.api.shared_system_client import SharedSystemClient
-        SharedSystemClient._identifier_to_system.clear()
-        return chromadb.PersistentClient(path=CHROMA_DIR)
+    """Get or create an in-memory ChromaDB client."""
+    return chromadb.EphemeralClient()
 
 
 def build_nist_index(nist_controls):
