@@ -65,7 +65,7 @@ The app will open at `http://localhost:8501`.
 |-----------|-----------|
 | Web Framework | Streamlit |
 | LLM | Google Gemini 3.6 Flash (free tier) |
-| Embeddings | sentence-transformers (`all-MiniLM-L6-v2`) |
+| Embeddings | ChromaDB default (`all-MiniLM-L6-v2` via ONNX) |
 | Vector Store | ChromaDB (persistent, local) |
 | Data Processing | pandas |
 | External Data | CISA KEV (live), NIST SP 800-53 Rev. 5 (live) |

@@ -1,7 +1,8 @@
 """
 nist_rag.py — RAG Pipeline for NIST SP 800-53 Rev. 5 Control Retrieval
 
-Embeds NIST SP 800-53 control descriptions into ChromaDB using sentence-transformers.
+Embeds NIST SP 800-53 control descriptions into ChromaDB using its default
+embedding function (lightweight, cloud-friendly).
 For each identified risk, retrieves the most relevant NIST control via semantic search.
 
 This is the RAG component: the NIST controls are unstructured prose text that
@@ -12,20 +13,18 @@ import os
 import hashlib
 import chromadb
 from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
+from chromadb.utils import embedding_functions
 import streamlit as st
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 CHROMA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
 COLLECTION_NAME = "nist_sp800_53_rev5"
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 
-@st.cache_resource(show_spinner="Loading embedding model...")
-def get_embedding_model():
-    """Load the sentence-transformer model (cached across reruns)."""
-    return SentenceTransformer(EMBEDDING_MODEL)
+def get_embedding_function():
+    """Get the embedding function — uses ChromaDB's default (lightweight)."""
+    return embedding_functions.DefaultEmbeddingFunction()
 
 
 def get_chroma_client():
@@ -52,12 +51,15 @@ def build_nist_index(nist_controls):
         print("WARNING: No NIST controls to index.")
         return None
 
-    model = get_embedding_model()
+    ef = get_embedding_function()
     client = get_chroma_client()
 
     # Check if collection already exists and is populated
     try:
-        collection = client.get_collection(name=COLLECTION_NAME)
+        collection = client.get_collection(
+            name=COLLECTION_NAME,
+            embedding_function=ef,
+        )
         if collection.count() > 0:
             print(f"NIST index already exists with {collection.count()} controls. Skipping rebuild.")
             return collection
@@ -72,6 +74,7 @@ def build_nist_index(nist_controls):
 
     collection = client.create_collection(
         name=COLLECTION_NAME,
+        embedding_function=ef,
         metadata={"description": "NIST SP 800-53 Rev. 5 Security Controls"},
     )
 
@@ -79,7 +82,6 @@ def build_nist_index(nist_controls):
     ids = []
     documents = []
     metadatas = []
-    embeddings = []
 
     for ctrl in nist_controls:
         ctrl_id = ctrl["control_id"]
@@ -97,19 +99,15 @@ def build_nist_index(nist_controls):
             "title": ctrl.get("title", ""),
         })
 
-    # Batch embed
+    # Add to collection in batches (ChromaDB handles embedding internally)
     print(f"Embedding {len(documents)} NIST controls...")
-    embeddings = model.encode(documents, show_progress_bar=True, batch_size=64).tolist()
-
-    # Add to collection in batches (ChromaDB has a limit)
-    BATCH_SIZE = 500
+    BATCH_SIZE = 100
     for i in range(0, len(ids), BATCH_SIZE):
         batch_end = min(i + BATCH_SIZE, len(ids))
         collection.add(
             ids=ids[i:batch_end],
             documents=documents[i:batch_end],
             metadatas=metadatas[i:batch_end],
-            embeddings=embeddings[i:batch_end],
         )
 
     print(f"Indexed {collection.count()} NIST controls into ChromaDB.")
@@ -128,12 +126,14 @@ def query_nist_control(risk_context, collection=None, top_k=3):
     Returns:
         List of dicts with: control_id, title, description, relevance_score
     """
-    model = get_embedding_model()
-
     if collection is None:
+        ef = get_embedding_function()
         client = get_chroma_client()
         try:
-            collection = client.get_collection(name=COLLECTION_NAME)
+            collection = client.get_collection(
+                name=COLLECTION_NAME,
+                embedding_function=ef,
+            )
         except Exception:
             print("WARNING: NIST index not found. Run build_nist_index first.")
             return []
@@ -141,12 +141,9 @@ def query_nist_control(risk_context, collection=None, top_k=3):
     if collection.count() == 0:
         return []
 
-    # Embed the query
-    query_embedding = model.encode([risk_context]).tolist()
-
-    # Query ChromaDB
+    # Query ChromaDB (it handles embedding the query internally)
     results = collection.query(
-        query_embeddings=query_embedding,
+        query_texts=[risk_context],
         n_results=top_k,
         include=["documents", "metadatas", "distances"],
     )
