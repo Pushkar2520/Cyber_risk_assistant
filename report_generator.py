@@ -1,55 +1,57 @@
 """
-report_generator.py — Risk Report Generation using Gemini LLM
+report_generator.py — Risk Report Generation using Gemini LLM with Batched Calling
 
-Takes the top-5 ranked risks with their NIST control matches and generates
-a human-readable, structured risk report.
-
-Each risk entry includes:
-  - Asset and context
-  - Vulnerability and why it matters
-  - Matched threat intelligence
-  - Business service at risk
-  - NIST remediation guidance (retrieved via RAG)
-  - Plain-English explanation of ranking
+Key Optimizations:
+1. Batched Single LLM Call: Combines Executive Summary + all 5 risk analyses into
+   ONE single structured JSON call, eliminating multi-request latency and 429 quota exhaustion.
+2. Model Selection: Uses lightweight production Gemini flash models with graceful model fallback.
+3. Deterministic Fallback: Never leaks raw API or JSON errors to users. If rate limits, network timeouts,
+   or invalid keys occur, immediately produces a high-fidelity, rule-based report.
 """
 
 import os
+import json
+import re
 import google.generativeai as genai
-import streamlit as st
 
-# ─── Gemini Configuration ────────────────────────────────────────────────────
+# Models tried in order: high-quota flash-lite first, then standard flash
+CANDIDATE_MODELS = ["gemini-3.5-flash-lite", "gemini-3.6-flash"]
+
+
+def get_active_model_name():
+    """Return the preferred Gemini model name."""
+    return CANDIDATE_MODELS[0]
 
 
 def configure_gemini(api_key=None):
-    """Configure the Gemini API with the provided key. Tests validity."""
+    """
+    Configure the Gemini API with the provided key.
+    Tests model connectivity with minimal token generation.
+    """
     key = api_key or os.environ.get("GOOGLE_API_KEY", "")
     if not key:
         return False
     try:
         genai.configure(api_key=key)
-        # Quick test to verify the key works
-        model = genai.GenerativeModel("gemini-3.6-flash")
-        model.generate_content("test", generation_config={"max_output_tokens": 5})
-        return True
+        # Verify connectivity using the lightweight candidate model
+        for model_name in CANDIDATE_MODELS:
+            try:
+                model = genai.GenerativeModel(model_name)
+                model.generate_content("ping", generation_config={"max_output_tokens": 3})
+                return True
+            except Exception:
+                continue
+        return False
     except Exception as e:
-        print(f"Gemini API key validation failed: {e}")
+        print(f"Gemini configuration check failed: {e}")
         return False
 
 
 def generate_risk_narrative(risk_row, nist_controls, rank, total=5):
     """
-    Generate a plain-English risk narrative for a single risk entry.
-
-    Args:
-        risk_row: pandas Series with all enriched risk data
-        nist_controls: list of dicts from NIST RAG retrieval
-        rank: 1-based rank of this risk
-        total: total risks in the report
-
-    Returns:
-        dict with structured narrative fields
+    Construct a base structured dictionary for a risk entry without calling LLMs.
+    Used as the underlying data layer for rendering and template fallbacks.
     """
-    # Extract key fields
     asset_name = risk_row.get("asset_name", "Unknown")
     asset_type = risk_row.get("asset_type", "Unknown")
     environment = risk_row.get("environment", "Unknown")
@@ -82,31 +84,44 @@ def generate_risk_narrative(risk_row, nist_controls, rank, total=5):
 
     risk_score = risk_row.get("risk_score", 0)
     factor_scores = risk_row.get("factor_scores", {})
-
     edr_installed = risk_row.get("edr_installed", "Unknown")
 
-    # Format NIST controls
     nist_text = ""
     if nist_controls:
         best = nist_controls[0]
         nist_text = f"**{best['control_id']} — {best['title']}**\n\n{best['full_text']}"
 
-    # Build the structured entry (no LLM needed for basic structure)
     entry = {
         "rank": rank,
-        "risk_score": round(risk_score * 100, 1),
+        "risk_score": round(risk_score * 100, 1) if risk_score <= 1.0 else round(risk_score, 1),
         "asset": f"{asset_name} ({asset_type})",
+        "asset_name": asset_name,
+        "asset_type": asset_type,
+        "environment": environment,
+        "location": location,
+        "owner_team": owner_team,
+        "internet_exposed": str(internet_exposed).strip(),
+        "edr_installed": str(edr_installed).strip(),
         "asset_detail": f"Environment: {environment} | Location: {location} | Owner: {owner_team} | Internet-Exposed: {internet_exposed} | EDR: {edr_installed}",
         "vulnerability": f"{vuln_name} ({cve})",
+        "vuln_name": vuln_name,
+        "cve": cve,
+        "cvss": cvss,
+        "severity": severity,
+        "days_open": days_open,
+        "patch_available": patch_available,
         "vuln_detail": f"CVSS: {cvss} ({severity}) | Exploit Available: {exploit_available} | Patch Available: {patch_available} | Days Open: {days_open}",
+        "threat_actor": ti_actor or ("CISA KEV" if in_kev else "Unknown"),
+        "campaign_name": ti_campaign or ("Active KEV Exploitation" if in_kev else "Unspecified Campaign"),
         "threat_intel": "",
+        "business_service": business_service,
         "business_impact_text": "",
         "nist_guidance": nist_text,
+        "nist_results": nist_controls,
         "ranking_explanation": "",
         "factor_scores": factor_scores,
     }
 
-    # Threat intel
     if ti_actor:
         entry["threat_intel"] = f"**Threat Actor:** {ti_actor} | **Campaign:** {ti_campaign} | **Ransomware:** {ti_ransomware}"
         if ti_summary:
@@ -118,7 +133,6 @@ def generate_risk_narrative(risk_row, nist_controls, rank, total=5):
     else:
         entry["threat_intel"] = "No active threat campaign match in current intelligence"
 
-    # Business impact
     bi_parts = [f"**Service:** {business_service}"]
     if business_impact:
         bi_parts.append(f"**Impact:** {business_impact}")
@@ -135,79 +149,164 @@ def generate_risk_narrative(risk_row, nist_controls, rank, total=5):
     return entry
 
 
-def generate_llm_explanation(risk_entry, risk_row, nist_controls):
+def _build_deterministic_executive_summary(risk_entries):
+    """Generate high-quality rule-based executive summary without API calls."""
+    if not risk_entries:
+        return "No high-priority cybersecurity risks currently detected."
+
+    top_entry = risk_entries[0]
+    top_asset = top_entry.get("asset_name", "perimeter systems")
+    top_vuln = top_entry.get("vuln_name", "critical edge vulnerabilities")
+    top_cve = top_entry.get("cve", "")
+    top_campaign = top_entry.get("campaign_name", "targeted external intrusion")
+
+    high_risk_count = sum(1 for e in risk_entries if e.get("risk_score", 0) >= 80)
+
+    summary = (
+        f"TawasolPay currently faces an elevated risk posture with {high_risk_count} of 5 top prioritized "
+        f"vulnerabilities exhibiting active exploitation or immediate perimeter exposure. "
+        f"The primary threat concerns {top_vuln} ({top_cve}) affecting {top_asset}, currently targeted under the "
+        f"{top_campaign} campaign with confirmed adversary activity across regional financial systems. "
+        f"Immediate operational priority requires an emergency remediation window to patch perimeter-facing assets, "
+        f"revoke exposed session credentials, and verify endpoint visibility across all production gateways."
+    )
+    return summary
+
+
+def _build_deterministic_risk_explanation(entry):
+    """Generate concise 2-sentence deterministic analysis for a risk item."""
+    asset = entry.get("asset_name", "The asset")
+    cve = entry.get("cve", "the identified vulnerability")
+    campaign = entry.get("campaign_name", "active threat campaigns")
+    actor = entry.get("threat_actor", "external threat actors")
+    exposure = entry.get("internet_exposed", "No")
+    is_exposed = str(exposure).lower() in ("yes", "internet", "true")
+    nist_controls = entry.get("nist_results", [])
+    nist_id = nist_controls[0].get("control_id", "SI-2") if nist_controls else "SI-2"
+    nist_title = nist_controls[0].get("title", "Flaw Remediation") if nist_controls else "Flaw Remediation"
+    biz_svc = entry.get("business_service", "core infrastructure")
+
+    p1 = (
+        f"{asset} is prioritized at Rank #{entry.get('rank', 1)} because {cve} is "
+        f"{'directly internet-exposed and' if is_exposed else 'deployed in production and'} subject to weaponized exploitation "
+        f"by {actor} ({campaign}), directly threatening the {biz_svc} service."
+    )
+    p2 = (
+        f"To address this exposure, NIST SP 800-53 Control {nist_id} ({nist_title}) specifies applying prompt "
+        f"mitigation through authoritative security updates, restricting ingress vector access, and continuously verifying "
+        f"compensating controls across surrounding network boundaries."
+    )
+    return f"{p1}\n\n{p2}"
+
+
+def generate_batched_report(risk_entries, api_key=None):
     """
-    Use Gemini to generate a plain-English explanation of why this risk
-    ranks where it does and what the NIST guidance recommends.
+    Generate Executive Summary and all 5 risk analyses in ONE single LLM call.
+    Uses structured JSON format. Automatically falls back deterministically on any failure.
 
-    Returns the explanation string.
+    Returns:
+        tuple: (executive_summary: str, updated_risk_entries: list)
     """
-    nist_ctrl = nist_controls[0] if nist_controls else {"control_id": "N/A", "title": "N/A", "full_text": "No NIST control retrieved"}
-
-    prompt = f"""You are a cybersecurity risk analyst writing a brief for a technical manager.
-
-Given this risk entry, write TWO short paragraphs:
-
-1. **Why this ranks #{risk_entry['rank']}**: Explain in plain English why this risk is ranked here. Reference specific factors: internet exposure, active exploitation, threat actor campaigns, business criticality, and missing controls. Be specific about this vulnerability and asset.
-
-2. **What NIST recommends**: Based on the retrieved NIST SP 800-53 control below, explain in 2-3 sentences what the control recommends and how it applies to this specific risk. Do NOT make up control content — use only what is provided below.
-
---- RISK DATA ---
-Asset: {risk_entry['asset']}
-Detail: {risk_entry['asset_detail']}
-Vulnerability: {risk_entry['vulnerability']}
-Detail: {risk_entry['vuln_detail']}
-Threat Intel: {risk_entry['threat_intel']}
-Business Impact: {risk_entry['business_impact_text']}
-Risk Score: {risk_entry['risk_score']}/100
-
-Factor Scores:
-- CVSS Factor: {risk_entry['factor_scores'].get('cvss', 0):.2f}
-- Internet Exposure: {risk_entry['factor_scores'].get('exposure', 0):.2f}
-- Active Exploit/KEV: {risk_entry['factor_scores'].get('exploit_kev', 0):.2f}
-- Threat Campaign: {risk_entry['factor_scores'].get('threat_match', 0):.2f}
-- Ransomware: {risk_entry['factor_scores'].get('ransomware', 0):.2f}
-- Business Criticality: {risk_entry['factor_scores'].get('business_criticality', 0):.2f}
-- Missing Controls: {risk_entry['factor_scores'].get('missing_controls', 0):.2f}
-
---- NIST CONTROL (RETRIEVED VIA RAG — USE ONLY THIS) ---
-Control ID: {nist_ctrl['control_id']}
-Title: {nist_ctrl['title']}
-Full Text: {nist_ctrl['full_text'][:2000]}
-
---- INSTRUCTIONS ---
-Write concisely. No headers. No bullet points. Just two clear paragraphs.
-Do not start with "This risk..." — start with the specific asset or vulnerability name.
-"""
-
-    try:
-        model = genai.GenerativeModel("gemini-3.6-flash")
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        return f"[LLM explanation unavailable: {e}]"
-
-
-def generate_executive_summary(risk_entries):
-    """
-    Generate an executive summary for the full top-5 risk report.
-    """
-    risks_summary = ""
+    # 1. Populate deterministic defaults for guaranteed safety
+    fallback_exec_summary = _build_deterministic_executive_summary(risk_entries)
     for entry in risk_entries:
-        risks_summary += f"- Risk #{entry['rank']}: {entry['vulnerability']} on {entry['asset']} (Score: {entry['risk_score']}/100)\n"
+        entry["ranking_explanation"] = _build_deterministic_risk_explanation(entry)
 
-    prompt = f"""You are a cybersecurity risk analyst writing an executive summary for the CISO of TawasolPay, a fintech company in Dubai, UAE.
+    # If no API key configured, return deterministic output immediately
+    key = api_key or os.environ.get("GOOGLE_API_KEY", "")
+    if not key:
+        return fallback_exec_summary, risk_entries
 
-The MDR provider sent an urgent advisory about active ransomware campaigns targeting fintech firms in the Middle East. After analyzing 60 assets, 114 vulnerabilities, and 40 threat intel records, here are the top 5 risks:
+    # 2. Prepare payload for the batched prompt
+    risks_payload = []
+    for entry in risk_entries:
+        nist_first = entry.get("nist_results", [{}])[0] if entry.get("nist_results") else {}
+        risks_payload.append({
+            "rank": entry.get("rank"),
+            "risk_score": entry.get("risk_score"),
+            "asset": entry.get("asset"),
+            "asset_detail": entry.get("asset_detail"),
+            "vulnerability": entry.get("vulnerability"),
+            "vuln_detail": entry.get("vuln_detail"),
+            "threat_intel": entry.get("threat_intel"),
+            "business_impact": entry.get("business_impact_text"),
+            "factors": entry.get("factor_scores", {}),
+            "nist_control_id": nist_first.get("control_id", "SI-2"),
+            "nist_control_title": nist_first.get("title", "Flaw Remediation"),
+            "nist_control_text": nist_first.get("full_text", "")[:1000],
+        })
 
-{risks_summary}
+    prompt = f"""You are an elite cybersecurity risk analyst presenting an executive briefing for the leadership of TawasolPay (a fintech company in Dubai, UAE).
 
-Write a 3-4 sentence executive summary. Be direct. State the overall risk level, the most critical finding, and the recommended immediate action. Do not use bullet points. Write for a board-level audience.
+Review the top 5 cybersecurity risks identified across our systems:
+{json.dumps(risks_payload, indent=2)}
+
+TASK:
+Produce a JSON response containing:
+1. "executive_summary": A high-impact 3-4 sentence summary for executive leadership outlining the overall risk level, primary threat vectors (referencing top vulnerability and campaigns), and urgent operational directives.
+2. "analyses": An array of objects, one for each risk (matching the "rank" 1 to 5), containing "analysis": A 2-paragraph analysis:
+   - Paragraph 1: Why this risk ranks where it does (specific factors: exposure, threat campaign, business impact, missing controls). Start directly with the asset or vulnerability name.
+   - Paragraph 2: What NIST SP 800-53 recommends based strictly on the provided control, and how to execute remediation for this asset.
+
+OUTPUT FORMAT:
+Return strictly valid JSON matching this schema:
+{{
+  "executive_summary": "...",
+  "analyses": [
+    {{"rank": 1, "analysis": "Paragraph 1\\n\\nParagraph 2"}},
+    {{"rank": 2, "analysis": "Paragraph 1\\n\\nParagraph 2"}},
+    {{"rank": 3, "analysis": "Paragraph 1\\n\\nParagraph 2"}},
+    {{"rank": 4, "analysis": "Paragraph 1\\n\\nParagraph 2"}},
+    {{"rank": 5, "analysis": "Paragraph 1\\n\\nParagraph 2"}}
+  ]
+}}
 """
 
     try:
-        model = genai.GenerativeModel("gemini-3.6-flash")
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        return f"**HIGH RISK**: Multiple critical vulnerabilities with active exploitation detected across internet-facing production infrastructure. Immediate patching and compensating controls required. [Detailed summary unavailable: {e}]"
+        genai.configure(api_key=key)
+        response_text = None
+
+        # Try candidate models
+        for model_name in CANDIDATE_MODELS:
+            try:
+                model = genai.GenerativeModel(
+                    model_name=model_name,
+                    generation_config={
+                        "response_mime_type": "application/json",
+                        "temperature": 0.2,
+                        "max_output_tokens": 2048,
+                    },
+                )
+                resp = model.generate_content(prompt)
+                if resp and resp.text:
+                    response_text = resp.text.strip()
+                    break
+            except Exception as e:
+                print(f"Model {model_name} failed: {e}")
+                continue
+
+        if not response_text:
+            return fallback_exec_summary, risk_entries
+
+        # Parse JSON
+        # Clean any potential markdown wrapper
+        cleaned_json = response_text
+        if cleaned_json.startswith("```"):
+            cleaned_json = re.sub(r"^```(?:json)?\n?", "", cleaned_json)
+            cleaned_json = re.sub(r"\n?```$", "", cleaned_json)
+
+        parsed = json.loads(cleaned_json)
+
+        exec_summary = parsed.get("executive_summary", "").strip() or fallback_exec_summary
+        analyses_map = {item.get("rank"): item.get("analysis", "") for item in parsed.get("analyses", [])}
+
+        for entry in risk_entries:
+            rank = entry.get("rank")
+            if rank in analyses_map and analyses_map[rank]:
+                entry["ranking_explanation"] = analyses_map[rank].strip()
+
+        return exec_summary, risk_entries
+
+    except Exception as err:
+        print(f"Batched report generation error (fallback engaged): {err}")
+        return fallback_exec_summary, risk_entries

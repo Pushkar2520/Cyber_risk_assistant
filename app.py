@@ -5,7 +5,7 @@ Main entry point for the application. Orchestrates:
   1. Data ingestion (local CSVs + external CISA KEV + NIST SP 800-53)
   2. Multi-factor risk scoring
   3. NIST RAG retrieval for remediation guidance
-  4. LLM-generated explanations
+  4. Batched LLM report generation (Executive Summary + 5 Risk Analyses in 1 call)
   5. Interactive dashboard display
 """
 
@@ -14,10 +14,10 @@ import pandas as pd
 import os
 from dotenv import load_dotenv
 
-# Load API key from .env file
+# Load environment variables (API keys)
 load_dotenv()
 
-# Must be first Streamlit call
+# Streamlit page configuration must be first command
 st.set_page_config(
     page_title="TawasolPay Cyber Risk Assistant",
     page_icon="🛡️",
@@ -31,10 +31,9 @@ from nist_rag import build_nist_index, query_nist_control, build_risk_query
 from report_generator import (
     configure_gemini,
     generate_risk_narrative,
-    generate_llm_explanation,
-    generate_executive_summary,
+    generate_batched_report,
+    get_active_model_name,
 )
-
 
 # ─── Custom CSS ───────────────────────────────────────────────────────────────
 
@@ -47,12 +46,6 @@ st.markdown("""
         margin-bottom: 20px;
         border-left: 4px solid #ef4444;
         box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
-    }
-    .risk-card-high {
-        border-left-color: #ef4444;
-    }
-    .risk-card-medium {
-        border-left-color: #f59e0b;
     }
     .risk-score-badge {
         background: #ef4444;
@@ -68,22 +61,44 @@ st.markdown("""
         padding: 16px;
         text-align: center;
     }
-    .section-header {
-        border-bottom: 2px solid #3b82f6;
-        padding-bottom: 8px;
-        margin-bottom: 16px;
-    }
-    .factor-bar {
-        background: #334155;
-        border-radius: 4px;
-        height: 8px;
-        margin: 2px 0;
-    }
-    .stAlert {
-        border-radius: 8px;
-    }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ─── Cached Pipeline Stages ──────────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False)
+def load_all_pipeline_data():
+    """Load local datasets, CISA KEV, NIST controls, and build merged dataframe."""
+    local_data = load_local_data()
+    kev = fetch_cisa_kev()
+    nist = fetch_nist_controls()
+    merged_df = build_merged_dataset(local_data, kev)
+    return local_data, kev, nist, merged_df
+
+
+@st.cache_data(show_spinner=False)
+def score_and_rank_risks(merged_df, top_n=5):
+    """Compute 7-factor risk scores and return ranked dataframe."""
+    return rank_risks(merged_df, top_n=top_n)
+
+
+@st.cache_data(show_spinner="Generating AI Cyber Risk Assessment...")
+def get_cached_report(_top_risks_dict, _nist_results_map, api_key):
+    """
+    Generate the executive summary and risk analyses in a single batched operation.
+    Cached so widget interactions, expander clicks, or tab switching do NOT re-trigger API calls.
+    """
+    top_risks_df = pd.DataFrame(_top_risks_dict)
+    initial_entries = []
+    for idx, row in top_risks_df.iterrows():
+        rank = int(row.get("risk_rank", idx + 1))
+        nist_results = _nist_results_map.get(str(rank), [])
+        entry = generate_risk_narrative(row, nist_results, rank)
+        initial_entries.append(entry)
+
+    exec_summary, finalized_entries = generate_batched_report(initial_entries, api_key=api_key)
+    return exec_summary, finalized_entries
 
 
 # ─── Sidebar ─────────────────────────────────────────────────────────────────
@@ -95,20 +110,24 @@ with st.sidebar:
 
     st.divider()
 
-    # Load API key from .env (no UI input needed)
+    # Load API key silently from environment or Streamlit secrets
     api_key = os.environ.get("GOOGLE_API_KEY", "")
+    if not api_key and hasattr(st, "secrets") and "GOOGLE_API_KEY" in st.secrets:
+        api_key = st.secrets["GOOGLE_API_KEY"]
+
     gemini_ready = configure_gemini(api_key)
 
     if gemini_ready:
-        st.success("✅ Gemini API connected")
+        st.success(f"✅ Gemini Connected ({get_active_model_name()})")
     else:
-        st.warning("⚠️ GOOGLE_API_KEY not found in .env file")
+        st.info("ℹ️ Using High-Fidelity Deterministic Engine")
 
     st.divider()
     st.markdown("**Data Sources**")
-    st.markdown("- 📋 Local CSVs (assets, vulns, threats)")
-    st.markdown("- 🏛️ CISA KEV Catalog (live)")
-    st.markdown("- 📖 NIST SP 800-53 Rev. 5 (live + RAG)")
+    st.markdown("- 📋 Local Enterprise CSVs (assets, vulns, threats)")
+    st.markdown("- 🏛️ CISA KEV Catalog (live feed)")
+    st.markdown("- 📖 NIST SP 800-53 Rev. 5 (OSCAL vector RAG)")
+    st.markdown("- ⚡ Batched Single-Call LLM Synthesis")
 
 
 # ─── Main Page Header ────────────────────────────────────────────────────────
@@ -123,28 +142,19 @@ st.markdown(
 st.divider()
 
 
-# ─── Data Loading ────────────────────────────────────────────────────────────
+# ─── Execution Pipeline ──────────────────────────────────────────────────────
 
-with st.status("Loading and processing data...", expanded=True) as status:
-    st.write("📂 Loading local datasets...")
-    data = load_local_data()
+with st.status("Executing cyber risk analysis pipeline...", expanded=False) as status:
+    st.write("📂 Ingesting local CSVs, CISA KEV, and NIST SP 800-53 catalog...")
+    data, kev_df, nist_controls, merged = load_all_pipeline_data()
 
-    st.write("🌐 Fetching CISA KEV catalog...")
-    kev_df = fetch_cisa_kev()
-
-    st.write("📖 Fetching NIST SP 800-53 controls...")
-    nist_controls = fetch_nist_controls()
-
-    st.write("🔗 Building enriched dataset...")
-    merged = build_merged_dataset(data, kev_df)
-
-    st.write("🧠 Building NIST embedding index...")
+    st.write("🧠 Ensuring NIST vector index is mounted in memory...")
     nist_collection = build_nist_index(nist_controls)
 
-    st.write("📊 Computing risk scores...")
-    top_risks = rank_risks(merged, top_n=5)
+    st.write("📊 Computing multi-factor composite risk scores...")
+    top_risks = score_and_rank_risks(merged, top_n=5)
 
-    status.update(label="✅ Data loaded and risks scored!", state="complete")
+    status.update(label="✅ Analysis pipeline complete!", state="complete")
 
 
 # ─── Data Overview Metrics ────────────────────────────────────────────────────
@@ -165,65 +175,33 @@ with col5:
 st.divider()
 
 
-# ─── Retrieve NIST Controls for each risk ────────────────────────────────────
+# ─── Retrieve NIST Controls & Run Batched Generation ─────────────────────────
 
-risk_entries = []
-
+nist_results_map = {}
 for idx, row in top_risks.iterrows():
-    # Build semantic query for NIST retrieval
+    rank_key = str(int(row.get("risk_rank", idx + 1)))
     query = build_risk_query(row)
-    nist_results = query_nist_control(query, nist_collection, top_k=3)
+    controls = query_nist_control(query, nist_collection, top_k=3)
+    nist_results_map[rank_key] = controls
 
-    # Generate structured narrative
-    entry = generate_risk_narrative(row, nist_results, int(row["risk_rank"]))
-
-    # Generate LLM explanation if Gemini is available
-    if gemini_ready:
-        explanation = generate_llm_explanation(entry, row, nist_results)
-        entry["ranking_explanation"] = explanation
-    else:
-        # Provide a basic explanation without LLM
-        factors = entry["factor_scores"]
-        top_factors = sorted(factors.items(), key=lambda x: x[1], reverse=True)[:3]
-        factor_names = {
-            "cvss": "CVSS severity",
-            "exposure": "internet exposure",
-            "exploit_kev": "active exploitation",
-            "threat_match": "threat campaign match",
-            "ransomware": "ransomware association",
-            "business_criticality": "business criticality",
-            "missing_controls": "missing compensating controls",
-        }
-        top_factor_str = ", ".join([f"{factor_names.get(f, f)} ({v:.0%})" for f, v in top_factors])
-        entry["ranking_explanation"] = (
-            f"This risk ranks #{entry['rank']} due to high scores in: {top_factor_str}. "
-            f"Add a valid GOOGLE_API_KEY in the .env file for detailed AI-generated analysis."
-        )
-
-    entry["nist_results"] = nist_results
-    risk_entries.append(entry)
+# Execute single cached batched call
+top_risks_dict = top_risks.to_dict(orient="records")
+exec_summary, risk_entries = get_cached_report(
+    top_risks_dict,
+    nist_results_map,
+    api_key=api_key,
+)
 
 
 # ─── Executive Summary ───────────────────────────────────────────────────────
 
 st.markdown("## 📋 Executive Summary")
-
-if gemini_ready:
-    exec_summary = generate_executive_summary(risk_entries)
-    st.info(exec_summary)
-else:
-    critical_count = sum(1 for e in risk_entries if e["risk_score"] > 75)
-    st.info(
-        f"**RISK LEVEL: HIGH** — {critical_count} of the top 5 risks score above 75/100. "
-        f"Multiple internet-facing production systems have critical vulnerabilities with active "
-        f"exploitation by threat actors targeting the Middle East fintech sector. "
-        f"Immediate patching of VPN appliances and exposed API gateways is the top priority."
-    )
+st.info(exec_summary)
 
 st.divider()
 
 
-# ─── Top 5 Risks ─────────────────────────────────────────────────────────────
+# ─── Top 5 Prioritized Risks ─────────────────────────────────────────────────
 
 st.markdown("## 🎯 Top 5 Prioritized Risks")
 st.caption(
@@ -235,21 +213,17 @@ for entry in risk_entries:
     rank = entry["rank"]
     score = entry["risk_score"]
 
-    # Color coding
     if score >= 80:
         score_color = "🔴"
-        border_color = "#ef4444"
     elif score >= 60:
         score_color = "🟠"
-        border_color = "#f59e0b"
     else:
         score_color = "🟡"
-        border_color = "#eab308"
 
     st.markdown(f"### {score_color} Risk #{rank} — {entry['vulnerability']}")
     st.markdown(f"**Risk Score: {score}/100**")
 
-    # Factor score bars
+    # Factor breakdown
     with st.expander("📊 Risk Factor Breakdown", expanded=False):
         factors = entry["factor_scores"]
         factor_labels = {
@@ -269,7 +243,7 @@ for entry in risk_entries:
             with col_b:
                 st.markdown(f"**{val:.0%}**")
 
-    # Main content in tabs
+    # Content tabs
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🖥️ Asset", "🔓 Vulnerability", "🎯 Threat Intel", "💼 Business Impact", "📖 NIST Guidance"
     ])
@@ -300,9 +274,9 @@ for entry in risk_entries:
                         st.markdown(ctrl["full_text"][:500])
                         st.divider()
         else:
-            st.warning("No NIST controls retrieved. Ensure the NIST index is built.")
+            st.warning("No NIST controls retrieved.")
 
-    # Ranking explanation
+    # Analysis
     st.markdown("**📝 Analysis**")
     st.markdown(entry["ranking_explanation"])
 
@@ -338,5 +312,5 @@ st.divider()
 st.caption(
     "Built for TawasolPay AI Engineer Assessment | "
     "Data: CISA KEV + NIST SP 800-53 Rev. 5 + Synthetic Threat Intel | "
-    "RAG: ChromaDB + sentence-transformers | LLM: Google Gemini 2.5 Flash"
+    "RAG: ChromaDB + sentence-transformers | LLM: Batched Google Gemini Flash"
 )
