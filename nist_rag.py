@@ -1,44 +1,49 @@
 """
 nist_rag.py — RAG Pipeline for NIST SP 800-53 Rev. 5 Control Retrieval
 
-Embeds NIST SP 800-53 control descriptions into ChromaDB using its default
-embedding function (lightweight, cloud-friendly).
+Embeds NIST SP 800-53 control descriptions into ChromaDB using sentence-transformers
+via chromadb.utils.embedding_functions.SentenceTransformerEmbeddingFunction.
 For each identified risk, retrieves the most relevant NIST control via semantic search.
-
-This is the RAG component: the NIST controls are unstructured prose text that
-benefits from embedding-based retrieval rather than keyword matching.
 """
 
 import os
 import hashlib
 import chromadb
-from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 import streamlit as st
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 COLLECTION_NAME = "nist_sp800_53_rev5"
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 
+@st.cache_resource(show_spinner="Initializing SentenceTransformer embedding function...")
 def get_embedding_function():
-    """Get the embedding function — uses ChromaDB's default (lightweight)."""
-    return embedding_functions.DefaultEmbeddingFunction()
+    """
+    Get the embedding function using sentence-transformers.
+    Cached across reruns so the model is loaded only once into memory.
+    """
+    return embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name=EMBEDDING_MODEL_NAME
+    )
 
 
+@st.cache_resource(show_spinner=False)
 def get_chroma_client():
-    """Get or create an in-memory ChromaDB client."""
+    """
+    Get or create an in-memory ChromaDB client.
+    Cached across reruns to preserve state without requiring filesystem persistence.
+    """
     return chromadb.EphemeralClient()
 
 
+@st.cache_resource(show_spinner="Embedding NIST controls into vector store...")
 def build_nist_index(nist_controls):
     """
     Embed and index NIST SP 800-53 controls into ChromaDB.
-
-    Each control becomes a document with:
-      - id: control_id (e.g., "SI-2")
-      - document: full text (title + description + discussion)
-      - metadata: control_id, title
+    Cached with @st.cache_resource so 1,196 controls are indexed once and reused
+    across Streamlit script reruns.
     """
     if not nist_controls:
         print("WARNING: No NIST controls to index.")
@@ -47,29 +52,16 @@ def build_nist_index(nist_controls):
     ef = get_embedding_function()
     client = get_chroma_client()
 
-    # Check if collection already exists and is populated
-    try:
-        collection = client.get_collection(
-            name=COLLECTION_NAME,
-            embedding_function=ef,
-        )
-        if collection.count() > 0:
-            print(f"NIST index already exists with {collection.count()} controls. Skipping rebuild.")
-            return collection
-    except Exception:
-        pass
-
-    # Create or recreate collection
-    try:
-        client.delete_collection(name=COLLECTION_NAME)
-    except Exception:
-        pass
-
-    collection = client.create_collection(
+    collection = client.get_or_create_collection(
         name=COLLECTION_NAME,
         embedding_function=ef,
         metadata={"description": "NIST SP 800-53 Rev. 5 Security Controls"},
     )
+
+    # If already populated, reuse existing collection
+    if collection.count() > 0:
+        print(f"NIST index already populated with {collection.count()} controls.")
+        return collection
 
     # Prepare documents
     ids = []
@@ -82,7 +74,7 @@ def build_nist_index(nist_controls):
         if not full_text.strip():
             continue
 
-        # Use a hash-based ID to avoid duplicates
+        # Use hash-based ID to ensure deterministic unique IDs
         doc_id = hashlib.md5(ctrl_id.encode()).hexdigest()
 
         ids.append(doc_id)
@@ -92,8 +84,8 @@ def build_nist_index(nist_controls):
             "title": ctrl.get("title", ""),
         })
 
-    # Add to collection in batches (ChromaDB handles embedding internally)
-    print(f"Embedding {len(documents)} NIST controls...")
+    # Batch add to collection
+    print(f"Embedding {len(documents)} NIST controls with {EMBEDDING_MODEL_NAME}...")
     BATCH_SIZE = 100
     for i in range(0, len(ids), BATCH_SIZE):
         batch_end = min(i + BATCH_SIZE, len(ids))
@@ -113,28 +105,28 @@ def query_nist_control(risk_context, collection=None, top_k=3):
 
     Args:
         risk_context: A string describing the risk (vulnerability + asset context)
-        collection: ChromaDB collection (if None, will get from client)
+        collection: ChromaDB collection (if None, fetched or created from client)
         top_k: Number of controls to retrieve
 
     Returns:
-        List of dicts with: control_id, title, description, relevance_score
+        List of dicts with: control_id, title, full_text, distance
     """
     if collection is None:
         ef = get_embedding_function()
         client = get_chroma_client()
         try:
-            collection = client.get_collection(
+            collection = client.get_or_create_collection(
                 name=COLLECTION_NAME,
                 embedding_function=ef,
             )
-        except Exception:
-            print("WARNING: NIST index not found. Run build_nist_index first.")
+        except Exception as e:
+            print(f"WARNING: Could not access collection: {e}")
             return []
 
     if collection.count() == 0:
         return []
 
-    # Query ChromaDB (it handles embedding the query internally)
+    # Query ChromaDB (embedding function automatically encodes query_texts)
     results = collection.query(
         query_texts=[risk_context],
         n_results=top_k,
@@ -142,7 +134,7 @@ def query_nist_control(risk_context, collection=None, top_k=3):
     )
 
     controls = []
-    if results and results["ids"] and results["ids"][0]:
+    if results and results.get("ids") and results["ids"][0]:
         for i in range(len(results["ids"][0])):
             controls.append({
                 "control_id": results["metadatas"][0][i].get("control_id", ""),
@@ -157,9 +149,6 @@ def query_nist_control(risk_context, collection=None, top_k=3):
 def build_risk_query(risk_row):
     """
     Build a semantic query string from a risk row for NIST control retrieval.
-
-    This constructs a query that captures the essence of the risk so that
-    the embedding search finds the most relevant NIST control.
     """
     parts = []
 
@@ -177,12 +166,12 @@ def build_risk_query(risk_row):
     if asset_name:
         parts.append(f"Asset: {asset_name} ({asset_type})")
 
-    # What kind of remediation is needed
+    # Affected component
     affected = risk_row.get("affected_component", "")
     if affected:
         parts.append(f"Affected component: {affected}")
 
-    # Add context about the type of security control needed
+    # Access / network context
     exposure = str(risk_row.get("asset_exposure", risk_row.get("internet_exposed", ""))).strip().lower()
     if exposure in ("internet", "yes"):
         parts.append("Internet-facing system requiring access control and monitoring")
