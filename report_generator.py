@@ -236,28 +236,29 @@ def generate_batched_report(risk_entries, api_key=None):
             "nist_control_text": nist_first.get("full_text", "")[:1000],
         })
 
-    prompt = f"""You are an elite cybersecurity risk analyst presenting an executive briefing for the leadership of TawasolPay (a fintech company in Dubai, UAE).
+    prompt = f"""You are an elite cybersecurity risk analyst writing an executive briefing for leadership at TawasolPay (fintech company in Dubai, UAE).
 
 Review the top 5 cybersecurity risks identified across our systems:
 {json.dumps(risks_payload, indent=2)}
 
 TASK:
-Produce a JSON response containing:
+Write a high-quality, professional risk report in valid JSON format:
 1. "executive_summary": A high-impact 3-4 sentence summary for executive leadership outlining the overall risk level, primary threat vectors (referencing top vulnerability and campaigns), and urgent operational directives.
-2. "analyses": An array of objects, one for each risk (matching the "rank" 1 to 5), containing "analysis": A 2-paragraph analysis:
-   - Paragraph 1: Why this risk ranks where it does (specific factors: exposure, threat campaign, business impact, missing controls). Start directly with the asset or vulnerability name.
-   - Paragraph 2: What NIST SP 800-53 recommends based strictly on the provided control, and how to execute remediation for this asset.
+2. "analyses": A list containing an object for each of the 5 risks (ranked 1 to 5). For each risk:
+   - "rank": The integer rank (1 to 5).
+   - "analysis": Write TWO detailed, substantive paragraphs (do NOT output placeholder words):
+       * Paragraph 1: Why this risk ranks where it does. Detail the specific asset, vulnerability, internet exposure, threat actor/campaign, business criticality, and missing controls.
+       * Paragraph 2: What NIST SP 800-53 recommends based on the retrieved control, and specific actionable steps for technical teams to remediate it.
 
-OUTPUT FORMAT:
-Return strictly valid JSON matching this schema:
+Return ONLY a valid JSON object matching this structure:
 {{
-  "executive_summary": "...",
+  "executive_summary": "TawasolPay faces an elevated...",
   "analyses": [
-    {{"rank": 1, "analysis": "Paragraph 1\\n\\nParagraph 2"}},
-    {{"rank": 2, "analysis": "Paragraph 1\\n\\nParagraph 2"}},
-    {{"rank": 3, "analysis": "Paragraph 1\\n\\nParagraph 2"}},
-    {{"rank": 4, "analysis": "Paragraph 1\\n\\nParagraph 2"}},
-    {{"rank": 5, "analysis": "Paragraph 1\\n\\nParagraph 2"}}
+    {{"rank": 1, "analysis": "Detailed first paragraph explaining ranking...\\n\\nDetailed second paragraph explaining NIST remediation..."}},
+    {{"rank": 2, "analysis": "Detailed first paragraph explaining ranking...\\n\\nDetailed second paragraph explaining NIST remediation..."}},
+    {{"rank": 3, "analysis": "Detailed first paragraph explaining ranking...\\n\\nDetailed second paragraph explaining NIST remediation..."}},
+    {{"rank": 4, "analysis": "Detailed first paragraph explaining ranking...\\n\\nDetailed second paragraph explaining NIST remediation..."}},
+    {{"rank": 5, "analysis": "Detailed first paragraph explaining ranking...\\n\\nDetailed second paragraph explaining NIST remediation..."}}
   ]
 }}
 """
