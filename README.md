@@ -6,7 +6,7 @@ Built for the TawasolPay AI Engineer take-home assessment.
 
 ---
 
-## 🚀 Quick Start
+##  Quick Start
 
 ### Prerequisites
 - Python 3.11+
@@ -34,7 +34,7 @@ The app will open at `http://localhost:8501`.
 
 ---
 
-## 🏗️ Architecture
+##  Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -72,7 +72,7 @@ The app will open at `http://localhost:8501`.
 
 ---
 
-## 📊 How Risk Scoring Works
+##  How Risk Scoring Works
 
 The system uses a **7-factor weighted composite score** that goes beyond CVSS alone:
 
@@ -90,7 +90,7 @@ The system uses a **7-factor weighted composite score** that goes beyond CVSS al
 
 ---
 
-## 📁 Project Structure
+##  Project Structure
 
 ```
 ├── app.py                    # Streamlit main application
@@ -140,15 +140,10 @@ If I had another day, the single most important improvement would be **attack ch
 
 ---
 
-## 🔑 API Keys
+##  API Keys
 
 The system uses **Google Gemini 3.6 Flash** (free tier) for generating plain-English explanations. You can:
 1. Enter the key in the sidebar when the app loads
 2. Set the `GOOGLE_API_KEY` environment variable
 3. The app works without a key — you just won't get AI-generated narratives
 
----
-
-## 📜 License
-
-This project is built for assessment purposes. All threat data is synthetic.
